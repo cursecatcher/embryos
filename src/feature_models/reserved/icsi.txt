@@ -1,0 +1,14 @@
+ID
+#blasto
+#mii
+#oo
+%blasto
+%fert
+bmi
+t2
+t2-tpnf
+t3
+t3-t2 (p2)
+t4-t3 (p3)
+t8-t4
+tpnf

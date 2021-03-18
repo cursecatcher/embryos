@@ -1,0 +1,4 @@
+	auc	accuracy	cohen-kappa	TP	FP	FN	TN	NO_precision	NO_recall	NO_f1-score	NO_support	SI_precision	SI_recall	SI_f1-score	SI_support
+scaler_log_reg	0.739	0.681	0.331	97	30	39	50	0.713	0.764	0.738	127	0.625	0.562	0.592	89
+scaler_r_forest	0.716	0.667	0.295	98	29	43	46	0.695	0.772	0.731	127	0.613	0.517	0.561	89
+scaler_g_boost	0.686	0.644	0.258	91	36	41	48	0.689	0.717	0.703	127	0.571	0.539	0.555	89
