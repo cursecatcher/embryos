@@ -6,178 +6,194 @@ sys.modules["sklearn.externals.six"] = six
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd 
+from collections import defaultdict, Counter
+from datetime import datetime
 
-from sklearn.base import clone
-from sklearn.model_selection import StratifiedKFold
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.metrics import classification_report, cohen_kappa_score
-
-from skrules import SkopeRules
-from rulefit import RuleFit
-
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import classification_report, cohen_kappa_score, confusion_matrix
+from skrules import DualSkoper, Rule, RuleModel
 
 import data_preparation as dp 
+from sampling import smote, bordersmote, adasyn
 
 
-# def apply_skrules(dataset, folds):
-#     clf = SkopeRules(feature_names=dataset.data.columns, n_estimators=333)
-#     X, y = dataset.data, dataset.target
-    
-#     for idx_train, idx_test in folds: 
-#         X_train, X_test = X.iloc[idx_train], X.iloc[idx_test]
-#         y_train, y_test = y[idx_train], y[idx_test]
+def get_train_val_data(dataset: dp.Dataset, feature_list_filename: str, validation = None):
+    #extract subset of features from dataset
+    curr_dataset = dataset.select_features(feature_list_filename)
+    #split in training/test and validation sets
+    if validation:
+        print("Validation set loaded from external source")
+        #fake split 
+        validation = validation.select_features(feature_list_filename)
 
-#         clf.fit(X_train, y_train)
-#         y_pred = clf.predict(X_test)
+        df_train, y_train = curr_dataset.data, curr_dataset.target
+        df_val, y_val = validation.data, validation.target 
+    else:
+        print("Validation set extracted from training set")
+        #split dataset in two portions 
+        X_train, X_val, y_train, y_val = train_test_split(
+            curr_dataset.data, 
+            curr_dataset.target, 
+            test_size=0.1,
+            stratify=curr_dataset.target)
 
-#         print(f"Baseline:\n{classification_report(y_test, y_pred)}")
+        #rebuild dataframes from numpy matrices 
+        df_train = pd.DataFrame(X_train, columns = curr_dataset.data.columns)
+        df_val = pd.DataFrame(X_val, columns = curr_dataset.data.columns)
 
-#         for nrules in range(1, 15):
-#             y_pred = clf.predict_top_rules(X_test, nrules)
-#             print(f"Performance using {nrules} rules:\n{classification_report(y_test, y_pred)}\n")
-
-
-# def apply_rulefit(dataset, folds):
-#     X, y = dataset.data, dataset.target
-
-#     for n, (idx_train, idx_test) in enumerate(folds, 1):
-#         X_train, X_test = X.iloc[idx_train], X.iloc[idx_test]
-#         y_train, y_test = y[idx_train], y[idx_test]
-
-#         clf = RuleFit(rfmode="classify").fit(X_train.values, y_train, feature_names=dataset.data.columns)
-#         y_pred = clf.predict(X_test.values)
-
-#         print(f"Performance on {n}th fold:\n{classification_report(y_test, y_pred)}")
-
-
-#         print(f"Importances:\n{clf.get_feature_importance()}")
+    return df_train, df_val, y_train, y_val
 
 
 
-def stuff(label, stats):
-    return {
-        f"{label}_{stat}": value for stat, value in stats.items()
-    } 
+def enrich_dataframe(df):
+    stats = ["mean", "std", "min", "25%", "50%", "75%", "max"]
+    df_stats = df.describe().loc[stats]
+    return pd.concat([df, df_stats])
+
+def reformat_ruleset(ruleset):
+    dictionary = { rule: stats for (rule, stats) in ruleset }
+    return pd.DataFrame.from_dict(dictionary).T
+
+
+def save_sheet(df, writer, sheet_name):
+    try:
+        df.to_excel(writer, sheet_name=sheet_name, float_format="%.3f", index=True)
+    except:
+        print(f"Cannot write {sheet_name} sheet")
 
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    #input dataset used for training (and eventually validation)
     parser.add_argument("-i", "--input", dest="input_db", type=str, required=True)
-    parser.add_argument("-o", "--output", dest="output_folder", type=str, required=True)
+    #explicit dataset used only for validation purposes
+    parser.add_argument("-v", "--validation", dest="validation_set", type=str)
+    #output folder for analysis' results
+    parser.add_argument("-o", "--output", dest="output_path", type=str, required=True)
+    #target feature to predict 
+    parser.add_argument("-t", "--target", dest="target_feature", type=str, required=True)
+    #
+    parser.add_argument("-l", "--labels", dest="labels_to_predict", type=str, nargs=2, required=True)
+    #provide a set of feature lists to reduce dataset dimensionality 
     parser.add_argument("-f", dest="feature_lists", nargs="*", default=list())
-    parser.add_argument("-r", "--num_rep", dest="num_replicates", type=int, default=0)
+    parser.add_argument("-r", "--num_rep", dest="num_replicates", type=int, default=1)
     parser.add_argument("--ignore", dest="features_to_ignore", nargs="*", default=list())
-    parser.add_argument("--mining", dest="enable_mining", action="store_true")
+    parser.add_argument("--n_cv", dest="num_folds_cv", default=3, type=int)
+    parser.add_argument("--index", dest="index_column", type=str)
+    
     args = parser.parse_args()
 
     filename = args.input_db
-    output_folder = args.output_folder
-    covariates_to_ignore = [
-        "Tecnica", ##use this 
-        "ID Paziente",
-        "tPNa", 
-        "tPNf-tPNa"
-    ]
-    covariates_to_ignore.extend(args.features_to_ignore)
+    output_path = args.output_path
+    covariates_to_ignore = args.features_to_ignore
+    covariate_to_predict = args.target_feature
+    target_labels = args.labels_to_predict
 
-    covariate_to_predict = "Output"
-    target_labels = ["NO", "SI"]
+    # datasets = dp.Dataset.read_from_excel(
+    #     filename, covariate_to_predict, target_labels, 
+    #     covs2ignore = covariates_to_ignore, 
+    #     index_column = args.index_column
+    # ) 
 
-    datasets = dp.Dataset.read_from_excel(
-        filename, None, covariate_to_predict, target_labels, 
-        covs2ignore = covariates_to_ignore
-    )
+    datasets = dp.Dataset.load_input_data(
+        filename, covariate_to_predict, target_labels, 
+        covs2ignore = covariates_to_ignore, 
+        index_column = args.index_column)
 
-    n_splits = 5 
-    n_estimators = 100 
-    kfold = StratifiedKFold(n_splits=n_splits, shuffle=True)
-    classifiers = {
-        # "rulefit_gb": (RuleFit, dict(
-        #     rfmode = "classify", 
-        #     tree_generator = GradientBoostingClassifier(n_estimators=n_estimators), 
-        #     n_jobs = -1
-        # )), 
-        # "rulefit_rf": (RuleFit, dict(
-        #     rfmode = "classify", 
-        #     tree_generator = RandomForestClassifier(n_estimators=n_estimators), 
-        #     n_jobs = -1
-        # )), 
-        "skoperules": (SkopeRules, dict(
-    #        feature_names = dataset.data.columns, 
-            n_estimators = n_estimators, 
-            n_jobs = -1, 
-            precision_min = 0.6, recall_min = 0.5
-        ))
-    }
+    validation = None 
+    if args.validation_set:
+        validation = dp.Dataset.load_input_data(
+            args.validation_set, covariate_to_predict, target_labels, 
+            covs2ignore = covariates_to_ignore, 
+            index_column = args.index_column)
+        validation = validation[args.validation_set]
 
 
-    result_per_dataset = dict()
-
-
-    for name, dataset in datasets.items():
-        print(f"Current dataset:\t{name}")
-        folds = list(kfold.split(dataset.data, dataset.target))
-
-        result_per_dataset[name] = performances = {clf: list() for clf in classifiers.keys()}
-
-        for n, (idx_train, idx_test) in enumerate(folds, 1):
-            print(f"\nTraining on fold #{n}...", end="", flush=True)
-
-            X_train, X_test = dataset.data.iloc[idx_train], dataset.data.iloc[idx_test]
-            y_train, y_test = dataset.target[idx_train], dataset.target[idx_test]
-
-
-            for clf_name, (clf_class, clf_args) in classifiers.items(): 
-                print(f"{clf_name}...", end="", flush=True)
-                #fit classifier on current training set, then predict on the relative test set 
-                
-                if clf_name == "skoperules":
-                    clf = clone(clf_class(**clf_args, feature_names=dataset.data.columns)).fit(X_train.values, y_train)
-                #for skoperules, after the classifier has been fitted, labels are predicted using the 1...N top rules
-        #            print("Training skope rules classifier...")
-                    for n_rules in range(1, 20):
-                        prediction = clf.predict_top_rules(X_test, n_rules)
-                        report = classification_report(y_test, prediction, output_dict=True)
-                        class_0, class_1 = [stuff(c, report.get(c)) for c in ("0", "1")]
-                        performances[clf_name].append(dict(
-                            n_rules = n_rules,
-                            n_fold = n,
-                            **class_0, 
-                            **class_1, 
-                            accuracy = report.get("accuracy"),
-                            cohen_k = cohen_kappa_score(y_test, prediction), 
-                            rule = clf.rules_[n_rules - 1][0]
-                        ))
-                else:
-     #               print("Training RuleFit")
-                    clf = clone(clf_class(**clf_args)).fit(X_train.values, y_train)
-                    #for rulefit, the classifier is trained and used in the normal way 
-                    prediction = clf.predict(X_test.values)
-                    #get classification stats
-                    report = classification_report(
-                        y_test, 
-                        prediction, 
-                        output_dict=True)
-                    class_0 = stuff("0", report.get("0"))
-                    class_1 = stuff("1", report.get("1"))
-                    performances[clf_name].append(dict(
-                        n_fold = n,
-                        **class_0, 
-                        **class_1, 
-                        accuracy = report.get("accuracy"),
-                        cohen_k = cohen_kappa_score(y_test, prediction)
-                    ))
+    if len(args.feature_lists) == 0:
+        exit("No feature list provided. Addios.")
     
-
-    with pd.ExcelWriter(f"{output_folder}/embrioni.xlsx", mode="w") as writer:
-        for dataset_name, perf_on_dataset in result_per_dataset.items():
-            for clf, results in perf_on_dataset.items():
-                pd.DataFrame.from_dict(results).to_excel(
-                    writer, 
-                    sheet_name=f"{dataset_name} {clf}", 
-                    float_format="%.3f", 
-                    index=False
-                )
+    if not os.path.exists(output_path):
+        os.mkdir(output_path)
 
 
+    feature_lists = list() 
+    for feature_list in args.feature_lists:
+        if os.path.isfile(feature_list):
+            feature_lists.append(feature_list)
+        else:
+            for root, folders, files in os.walk(feature_list):
+                feature_lists.extend([os.path.join(root, f) for f in files])
+
+
+    for feature_file in feature_lists:
+        print(f"Using feature file: {feature_file}")
+        
+        result_per_dataset = dict()
+
+        for name, dataset in datasets.items():
+            print(f"Current dataset: {name}")
+            print(f"Class proportion: {Counter(dataset.target)}")
+
+            df_train, df_val, y_train, y_val = get_train_val_data(
+                dataset, feature_file, validation)
+
+            print(df_train.describe())
+            print(df_val.describe())
+
+            print(f"Data proportion in (original) training-test set: {Counter(y_train)}")
+            print(f"Data proportion in validation set: {Counter(y_val)}")
+
+            ##train model based on recall
+            print("Training model based on recall", flush=True)
+            clf_params = dict(
+                n_cv_folds = args.num_folds_cv, 
+                n_repeats = args.num_replicates, 
+                n_estimators = 500
+            )
+
+            rm_recall = RuleModel(recall_min=0.7, **clf_params)
+            rm_recall.fit(df_train, y_train)
+
+            ##train model based on precision 
+            print("Training model based on precision", flush=True)
+            rm_precision = RuleModel(precision_min=0.7, **clf_params)
+            rm_precision.fit(df_train, y_train)
+            
+            ##merge the two rulesets previously obtained
+            rm = RuleModel(recall_min=0.7, precision_min=0.7)
+            rm.ruleset = rm_recall.ruleset + rm_precision.ruleset
+            
+            ##validate the ruleset against the validation set 
+            rm.validate(df_val, y_val)
+
+            print("Rules survived to the validation:")
+
+            for x, _ in rm.ruleset:
+                print(x)
+
+            print(flush=True)
+
+            result_per_dataset[name] = dict(
+                ruleset = rm.ruleset, 
+                reports = rm.reports, 
+                test_whole = rm.test_rules(dataset.data, dataset.target),
+                test_training = rm.test_rules(df_train, y_train),
+                test_valid = rm.test_rules(df_val, y_val)
+            )
+
+
+        
+        feature_list_name = "_".join(os.path.basename(feature_file).split(".")[:-1])
+        fln = f"{feature_list_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        xlsx_file = f"{output_path}/{fln}.xlsx"
+
+        with pd.ExcelWriter(xlsx_file, mode="w") as writer:
+            print(f"Saving results in {xlsx_file}")
+            
+            for dataset_name, data2save in result_per_dataset.items():
+                for key in ("ruleset", "test_whole", "test_training", "test_valid"):
+                    data = data2save.get(key)
+                    df = reformat_ruleset(data)
+
+                    save_sheet(df, writer, key) 

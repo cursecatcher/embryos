@@ -7,6 +7,7 @@ import pandas as pd
 import os 
 import utils 
 from functools import reduce 
+from collections import Counter
 from multiprocessing import Pool 
 
 import data_preparation as dp 
@@ -36,14 +37,21 @@ class BestFeatureNumberFinder:
         self.__evaluation_k_features = list()
 
     
-    def evaluate(self, dataset, num_trials):
+    def evaluate(self, dataset, num_trials, feature_list=None):
         tmp_folder = os.path.join(self.__output_folder, "replicates", "rep_{}")
+
+        try:
+            #if a feature list is provided, the dataset is properly filtered
+            dataset = dataset.select_features(feature_list=feature_list)
+        except:
+            pass #if no feature list is provided, then do nothing
+
         # train N times the classifiers on (X,y) dataset saving the 
         # results in different folders named as rep_{n_iter}
         X, y = dataset.data, dataset.target 
         dfs = list() 
         for n in range(num_trials):
-            print("\nReplicate #{}".format(n + 1))
+            print(f"\nReplicate #{n+1}")
             dfs.append(self.__generate_data(X, y, tmp_folder.format(n), self.__target_labels))
 
         print()
@@ -63,7 +71,8 @@ class BestFeatureNumberFinder:
         n_tot_features =  X.shape[1]
 
         for k in range(1, n_tot_features + 1):
-            print("\nNum feature = {} / {}".format(k, n_tot_features), end="")
+            break_flag = False 
+            print(f"\nNum feature = {k} / {n_tot_features}", end="")
 
             #instantiate pipelines 
             kbest = pp.KBestEstimator(X, k).get_pipelines()
@@ -71,10 +80,18 @@ class BestFeatureNumberFinder:
 
             pipelines = [pipeline for pipeline, _ in kbest + sfm]
 
-            evaluator = clfy.PipelinesEvaluator(X, y, n_folds=10, target_labels=self.__target_labels)
-            df_eval = evaluator.evaluate(pipelines, os.path.join(output_folder, "k_{}".format(k)))
-            df_eval[self.__n_features_column_name] = k
-            df_list.append(df_eval)
+            try:
+                evaluator = clfy.PipelinesEvaluator(X, y, n_folds=10, target_labels=self.__target_labels)
+                df_eval = evaluator.evaluate(pipelines, os.path.join(output_folder, f"k_{k}"))
+                df_eval[self.__n_features_column_name] = k
+                df_list.append(df_eval)
+            except ValueError:
+                break_flag = True 
+            
+            ### XXX - while instead of for
+            if break_flag:
+                print("Invalid number of features. Breaking bad loop.")
+                break 
 
             try:
                 #append evaluator to the k-th list 
@@ -87,17 +104,25 @@ class BestFeatureNumberFinder:
         return pd.concat(df_list)
 
     def make_report(self, df, measures):
+        def get_feature_list(df: pd.DataFrame, k: int) -> pd.Series:
+            fcounts = Counter(df.to_numpy().flatten())
+            if fcounts.get(np.nan):
+                del fcounts[np.nan]
+            selected = sorted([x for x, y in fcounts.most_common(k)])
+            return pd.Series(selected)
+            
+
         if not isinstance(measures, list):
             measures = [measures]
 
         for measure in measures:
-            print("Measure: {}".format(measure.upper()))
-            current_outfolder = utils.make_folder(self.__output_folder, "ranking_{}".format(measure))
+            print(f"Measure: {measure.upper()}")
+            current_outfolder = utils.make_folder(self.__output_folder, f"ranking_{measure}")
 
             for clf_name, subdf in df.groupby(df.index):
                 sorted_df = subdf.sort_values(by=[measure, self.__n_features_column_name], ascending=[False, True])
                 sorted_df.to_csv(
-                    os.path.join(current_outfolder, "{}_x_feature.{}.tsv".format(clf_name, measure)), 
+                    os.path.join(current_outfolder, f"{clf_name}_x_feature.{measure}.tsv"), 
                     sep="\t", 
                     float_format="%.4g"
                 )
@@ -107,6 +132,10 @@ class BestFeatureNumberFinder:
                 # print("{} - best number of features is {}".format(clf_name, best_k))
 
                 for k, evaluation in enumerate(self.__evaluation_k_features, 1):
+                    outdir = utils.make_folder(
+                        self.__output_folder, 
+                        os.path.join("feature_extraction", f"{k}_features")
+                    )
                     best_features_per_clf = list()
 
                     for result_run in evaluation:
@@ -115,16 +144,11 @@ class BestFeatureNumberFinder:
                                 for it in result_run])
 
                     feature_importances = pd.DataFrame(data=[x.to_series().tolist() for x in best_features_per_clf])
-                    outdir = utils.make_folder(
-                        self.__output_folder, 
-                        os.path.join("feature_extraction", "{}_features".format(k))
-                    )
-                    feature_importances.to_csv(
-                        os.path.join(outdir, "report_{}.k_{}.{}.tsv".format(clf_name, k, measure)), 
+                    get_feature_list(feature_importances, k).to_csv(
+                        os.path.join(outdir, f"report_{clf_name}.k_{k}.{measure}.tsv"), 
                         sep="\t", 
-                        header=False 
+                        header=False
                     )
-
 
 
     def __plot_trend(self, df, measures):
@@ -145,11 +169,11 @@ class BestFeatureNumberFinder:
             plt.xticks(list(range(1, int(df[self.__n_features_column_name].max()) + 1)))
             plt.xlabel("Number of features")
             plt.ylabel(measure.upper())
-            plt.savefig(os.path.join(self.__output_folder, "{}_plot_n_features.pdf".format(measure)))
+            plt.savefig(os.path.join(self.__output_folder, f"{measure}_plot_n_features.pdf"))
             plt.close(fig)
 
 def best_k_finder(dataset, mirna_list, output_folder):
-    data = dataset.select_features(miRNA_file = mirna_list)
+    data = dataset.select_features(mirna_list)
     dataset_name = os.path.basename(os.path.splitext(mirna_list)[0])
 
     current_output_folder = os.path.join(args.output_folder, dataset_name, "k_best")
@@ -163,12 +187,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
     parser.add_argument("-o", "--output", dest="output_folder", type=str)
+    # optional argument: if it on, covs argument has to 
+    # indicate the name of the sheet which contains the sample data
+    parser.add_argument("-x", "--xlsx", dest="excel_file", type=str)
     # count matrix
     parser.add_argument("--cm", dest="count_matrices", nargs="*", default=list())
     # covariate matrix 
     parser.add_argument("--covs", dest="covariates", nargs="*", default=list())
     # covariate info 
-    parser.add_argument("--info", dest="covariate_types")
+ #   parser.add_argument("--info", dest="covariate_types", type=str)
     # target covariate to predict 
     parser.add_argument("-t", "--target", dest="target_covariate", type=str, required=True)
     # mirna list to restrict the count matrix 
@@ -182,17 +209,33 @@ if __name__ == "__main__":
 
     args = parser.parse_args() 
 
-    dataset = dp.Dataset.do_preprocessing(
-        args.count_matrices, args.covariates, args.covariate_types, 
-        args.target_covariate, args.binary_classification_targets,
-        args.covariates_to_use, args.covariates_to_ignore
-    )
+    if args.excel_file:
+        dataset = dp.Dataset.read_from_excel(
+            args.excel_file, args.target_covariate, args.binary_classification_targets,
+            args.covariates_to_use, args.covariates_to_ignore)
 
-    # with Pool(os.cpu_count() - 1) as pool:
-    #     pool.map(
-    #         best_k_finder_paral, 
-    #         [(dataset, mirna_list, args.output_folder) for mirna_list in args.mirna_list]
-    #     )
+        if len(dataset) > 1:
+            raise Exception("Currently we support only one dataset at the time. Please check your excel file.")
+        
+        dataset = dataset[list(dataset.keys())[0]]
+
+        if args.count_matrices:
+            count_matrices = [pd.read_csv(cm_file, sep="\t").T for cm_file in args.count_matrices]
+            df = pd.concat(count_matrices)
+            
+            
+
+
+
+        raise Exception()
+        
+    else:        
+        dataset = dp.Dataset.do_preprocessing(
+            args.count_matrices, args.covariates, None, #args.covariate_types, 
+            args.target_covariate, args.binary_classification_targets,
+            args.covariates_to_use, args.covariates_to_ignore
+        )
+
 
     for mirna_list in args.mirna_list:
         best_k_finder(dataset, mirna_list, args.output_folder)

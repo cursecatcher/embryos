@@ -6,41 +6,168 @@ import numpy as np
 import matplotlib.pyplot as plt  
 
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+from collections import Counter  
 
 class MultipleLabelsException(Exception):
     def __init__(self, labels):
         message = (
             f"The dataset contains more than 2 labels ({labels}).\n"
-            "You have to specify the --binary option.")
+            "Please specify the --binary option.")
+        super().__init__(message)
+ 
+class UnsupportedFileType(Exception):
+    def __init__(self, filename):
+        message = f"Unsupported file type => {filename}"
         super().__init__(message)
 
 
+#load dataframes from files also allowing DataFrame objects
+def fix_input(list_of_stuff: list, transpose=False):
+    result = list() 
+    for stuff in list_of_stuff:
+        if isinstance(stuff, pd.DataFrame):
+            result.append(stuff)
+        elif isinstance(stuff, str):
+            df = pd.read_csv(stuff, sep="\t", index_col=0)
+            result.append(df if transpose is False else df.T)
+    
+    return [prepare_feature_names(x) for x in result] 
+
+def prepare_feature_names(df: pd.DataFrame):
+    if isinstance(df, pd.DataFrame):
+        df.columns = df.columns.str.lower().str.replace(' ', '_').str.replace('-', '_').str.replace(":", "_")
+    elif isinstance(df, pd.Series):
+        df = df.str.lower().str.replace(' ', '_').str.replace('-', '_').str.replace(':', '_')
+    return df 
+
+
 class Dataset:
-    def __init__(self):
-        self.__covariate_matrix = None 
+    def __init__(self, count_matrices = None, covariate_matrices = None):
+        self.__covariate_matrix = None ## XXX to rename
         self.__target = None 
         self.__target_labels = None 
+        self.__features_names = None 
+
+        if isinstance(count_matrices, list) and isinstance(covariate_matrices, list):
+            covariates = pd.concat(fix_input(covariate_matrices))
+            counts = pd.concat(fix_input(count_matrices, transpose=True))
+            
+            # print(Counter(covariates["class"]))
+
+            # print(f"Shapes now: {covariates.shape} -- {counts.shape}")
+
+            if len(counts) > 0:
+                covariates = pd.merge(covariates, counts, left_index=True, right_index=True)
+            
+                # print(f"Matrices merged; new shape: {covariates.shape}")
+                # print(Counter(covariates["class"]))
+            
+            self.__covariate_matrix = covariates
+
+            # self.__count_matrix = pd.concat(counts) if counts else None 
+            # self.__covariate_matrix = pd.concat(covariates) if covariates else None 
+        
+        
+
+
+    # def __init__(self):
+    #     self.__covariate_matrix = None 
+    #     self.__target = None 
+    #     self.__target_labels = None 
+    #     self.__target_encoding = None 
 
     @classmethod
-    def read_from_excel(cls, excel_filename, covs_types, cov2predict, target_labels, covs2use = None, covs2ignore = None):
+    def load_input_data(cls, input_data, cov2predict, target_labels, covs2use = None, covs2ignore = None, index_column = None):
+        dataframes = list()
+
+        #load data 
+        if input_data.endswith(".xlsx"):
+            #load data from excel file to one or more dataframes 
+            with pd.ExcelFile(input_data) as xlsx:
+                for sheet_name in xlsx.sheet_names:
+                    dataframes.append((sheet_name, pd.read_excel(xlsx, sheet_name=sheet_name)))
+
+        elif any([input_data.endswith(ext) for ext in (".csv", ".tsv", ".txt")]):
+            separator = "," if input_data.endswith(".csv") else "\t"
+            dataframes.append((input_data, pd.read_csv(input_data, sep=separator, index_col=0)))
+
+        else:
+            raise UnsupportedFileType(input_data)
+
+        #preprocess data:
+        #remove useless cols, extract target to predict, encode categorical etc 
+        datasets = dict() 
+        for name, df in dataframes:
+            #normalise column names 
+            df.columns = df.columns.str.lower() 
+
+            if index_column:
+                df.set_index(index_column.lower(), inplace=True)
+            
+            #remove unnecessary columns
+            bad_cols = [col.lower() for col in covs2ignore]
+            bad_cols.extend([col for col in df.columns if col.startswith("unnamed:")])
+            if bad_cols:
+                df.drop(columns=bad_cols, inplace=True)
+            #fix numerical values and encode categorical features
+            cov2predict = cov2predict.lower()
+            for col in df.columns:
+                if col != cov2predict:
+                    try:
+                        df[col] = df[col].apply(lambda x: float(str(x).split()[0].replace(",", "")))
+                        df[col].astype("float64").dtypes 
+                    except ValueError:
+                        #probably we encountered a categorical feature 
+                        df[col] = df[col].astype("category")
+                        df[col] = df[col].cat.codes
+            #fill missing values     
+            if df.isnull().sum().sum() > 0:
+                df.fillna(df.mean(), inplace=True)
+        
+            #remove strange characters from features names
+            dataset = Dataset()
+            dataset.__covariate_matrix = prepare_feature_names(df)
+
+            dataset.filter_by_target(cov2predict, target_labels)
+
+            datasets[name] = dataset 
+
+
+        return datasets 
+
+
+
+    @classmethod
+    def read_from_excel(cls, excel_filename, cov2predict, target_labels, covs2use = None, covs2ignore = None, index_column = None):
         datasets = dict() 
 
         with pd.ExcelFile(excel_filename) as xlsx:
             cov2predict = cov2predict.lower()
 
             for sheet_name in xlsx.sheet_names: 
-                datasets[sheet_name] = dataset = Dataset() 
-                df = dataset.__covariate_matrix = pd.read_excel(xlsx, sheet_name=sheet_name)
-                df.columns = df.columns.str.lower() 
+                dataset = Dataset() 
+                df = pd.read_excel(xlsx, sheet_name=sheet_name)
+                df.columns = df.columns.str.lower()
+
+                if index_column:
+                    df.set_index(index_column.lower(), inplace=True)
 
                 bad_cols = [col for col in df.columns if col.startswith("unnamed:")]
-                bad_cols.extend([col.lower() for col in covs2ignore])
-                df.drop(columns=bad_cols, inplace=True)
+                if covs2ignore:
+                    bad_cols.extend([col.lower() for col in covs2ignore])
+                if bad_cols:
+                    df.drop(columns=bad_cols, inplace=True)
 
                 for colname in df.columns:
                     if colname != cov2predict:
-                        df[colname] = df[colname].apply(lambda x: float(str(x).split()[0].replace(",", "")))
-                        df[colname].astype("float64").dtypes
+                        try:
+                            df[colname] = df[colname].apply(lambda x: float(str(x).split()[0].replace(",", "")))
+                            df[colname].astype("float64").dtypes
+                        except ValueError:
+                            #probably we encountered a categorical feature 
+                            df[colname] = df[colname].astype("category")
+                            df[colname] = df[colname].cat.codes 
+                            
 
                 if df.isnull().sum().sum() > 0:
                     df.fillna(df.mean(), inplace=True)
@@ -53,9 +180,54 @@ class Dataset:
             # sns.heatmap(corr, mask=np.zeros_like(corr, dtype=np.bool), cmap=sns.diverging_palette(220, 10, as_cmap=True), square=True, ax=ax)
             # plt.savefig("{}_correlation_matrix.png".format(sheet), dpi = 400)
 
+                df.columns = df.columns.str.replace(' ', '_')
+                df.columns = df.columns.str.replace('-', '_')
+                df.columns = df.columns.str.replace(":", "_")
+    
+                dataset.__covariate_matrix = df
+                
+
+                # ####
+                # dfff = dataset.__covariate_matrix
+                # h = dfff.loc[dfff["id_pathology"] == "Healthy"]
+                # crc = dfff.loc[dfff["id_pathology"] == "CRC"]
+
+                # print(h.describe())
+
+                # print(crc.describe())
+
+                # with pd.ExcelWriter("pippo.xlsx", mode="w") as writer:
+                #     crc.describe().to_excel(
+                #         writer, sheet_name="crc", float_format="%.3f", index=True)
+
+                #     h.describe().to_excel(
+                #         writer, sheet_name="h", float_format="%.3f", index=True)
+
+                # # raise Exception("fine")  
+
+                ####
+
                 dataset.filter_by_target(cov2predict, target_labels)
-        
+
+                datasets[sheet_name] = dataset 
+
         return datasets 
+    
+    @classmethod
+    def do_preprocessing(cls, count_matrices, covariate_matrices, covs_types, cov2predict, target_labels, covs2use, covs2ignore):
+        dataset = Dataset(count_matrices, covariate_matrices)
+
+        if covs2use:
+            f_to_keep = covs2use + [cov2predict]
+            dataset.select_covariates(f_to_keep)
+        elif covs2ignore:
+            dataset.remove_covariates(covs2ignore)
+        
+        dataset.filter_by_target(cov2predict, target_labels)
+        dataset.fix_missing_values() #not implemented 
+#        dataset.encode_categorical(covs_types)
+
+        return dataset 
     
     @property
     def cov_matrix(self):
@@ -79,19 +251,27 @@ class Dataset:
         from the allowed values. 
         Remove the target covariate from the matrix and return it as output"""
 
-        target_cov = target_cov.lower()
+        target_cov = target_cov.lower() 
+
+        print(f"Target: {target_cov}\nLabels: {allowed_values}")
+        # print(self.data.columns)
+        print(self.data)
 
         if not allowed_values:
             allowed_values = set(self.cov_matrix[target_cov])
             if len(allowed_values) != 2:
                 raise MultipleLabelsException(allowed_values)
 
+        self.__target_labels = allowed_values
         mask = self.cov_matrix[target_cov].isin(allowed_values)
-        covs_matrix = self.cov_matrix[mask]
-        self.__target_labels = sorted(allowed_values)
-        self.__target = LabelEncoder().fit(self.__target_labels).transform(covs_matrix[target_cov])
+        cov_masked = self.cov_matrix[mask]
 
-        self.__covariate_matrix = covs_matrix.drop(columns=[target_cov])
+        mapping = {label: encoding for encoding, label in enumerate(allowed_values)}
+        self.__target = cov_masked[target_cov].replace(mapping).to_numpy()
+        self.__covariate_matrix = cov_masked.drop(columns=[target_cov])
+        self.__target_encoding = mapping
+
+        print(f"\nTarget labels encoded with the following mapping: {mapping}")
 
         return self
         
@@ -133,7 +313,7 @@ class Dataset:
                 categories.append(unique_values)
                 more_than_binary_covariates.append(cov)
                 for cat in unique_values:
-                    dataframe_columns.append("{}_{}".format(cov, cat))
+                    dataframe_columns.append(f"{cov}_{cat}")
             else:
                 binary_covariates.append(cov)
 
@@ -161,15 +341,23 @@ class Dataset:
             axis=1
         )
 
-    def select_features(self, feature_file = None):
+    def select_features(self, feature_file=None, feature_list=None):
         """ """
+        flist = feature_list if feature_list else \
+                        pd.read_csv(feature_file, index_col=0, sep="\t") \
+                            if feature_file else None
+        if flist is None:
+            raise Exception("eeeeeeh")
+            
         dataset = Dataset()
         dataset.__target = self.__target 
         dataset.__target_labels = self.__target_labels
 
-        covariates = pd.read_csv(feature_file, index_col=0, sep="\t").index
+
+        covariates = prepare_feature_names(flist.index.to_series())
+
         dataset.__covariate_matrix = self.__covariate_matrix[covariates]
-        print(f"Covariate matrix filtered. The following covariates have been selected from {feature_file}")
+        print(f"Covariate matrix filtered. Covariates have been selected from {flist.index} (file={feature_file})")
         
         
         return dataset
