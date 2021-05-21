@@ -8,6 +8,8 @@ import pandas as pd
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import StratifiedKFold
 import sklearn.metrics as metrics 
+from sklearn.base import clone 
+# from copy import deepcopy as clone
 
 import pipelines as pp 
 import utils 
@@ -78,6 +80,18 @@ class PipelineEvaluator:
 
         self.__init()
     
+    def __init(self):
+        for pipeline in self.__pipelines:
+            ## TODO - data structure have to be replaced by a class 
+            self.__predictions[pipeline] = list() 
+            self.__rocs[pipeline] = None 
+            self.__features[pipeline] = pd.DataFrame()
+
+        # self.__predictions = {pipeline: list() for pipeline in self.__pipelines}
+        # self.__rocs = {pipeline: None for pipeline in self.__pipelines}
+        # self.__avg_roc = {pipeline: list() for pipeline in self.__pipelines}
+        # self.__features = {pipeline: pd.DataFrame() for pipeline in self.__pipelines}
+        # self.__true_y = list() 
 
     @property
     def output_folder(self):
@@ -95,19 +109,6 @@ class PipelineEvaluator:
         }
     
 
-    def __init(self):
-        for pipeline in self.__pipelines:
-            ## TODO - data structure have to be replaced by a class 
-            self.__predictions[pipeline] = list() 
-            self.__rocs[pipeline] = None 
-            self.__features[pipeline] = pd.DataFrame()
-
-        # self.__predictions = {pipeline: list() for pipeline in self.__pipelines}
-        # self.__rocs = {pipeline: None for pipeline in self.__pipelines}
-        # self.__avg_roc = {pipeline: list() for pipeline in self.__pipelines}
-        # self.__features = {pipeline: pd.DataFrame() for pipeline in self.__pipelines}
-        # self.__true_y = list() 
-
 
     def test_cv(self, X, y, n_splits=10, file_prefix=""):
         self.__init()
@@ -116,11 +117,8 @@ class PipelineEvaluator:
         folds = list(StratifiedKFold(n_splits=n_splits, shuffle=True).split(X, y))
         self.__true_y = sum([list(y[idx_test]) for _, idx_test in folds], [])
 
-        file_prefix = "ROC_{}".format(file_prefix)
+        file_prefix = f"ROC_{file_prefix}"
         mean_fpr = np.linspace(0, 1, 100)
-
-#        relevant_features = list()
-        rules = list()
 
         for clf in self.__pipelines:
             tprs, aucs = list(), list() 
@@ -132,36 +130,16 @@ class PipelineEvaluator:
                 X_train, X_test = X.iloc[idx_train], X.iloc[idx_test]
                 y_train, y_test = y[idx_train], y[idx_test]
 
-                self.__predictions[clf].extend(clf.fit(X_train, y_train).predict(X_test))
+                classifier = clone(clf)
 
-                try:
-                    rf_rules = tr.RandomForestRuleExtractor(clf[-1])
-                    rules.append(rf_rules)
+                self.__predictions[clf].extend(classifier.fit(X_train, y_train).predict(X_test))
 
-                except:
-                    pass 
-#                    print(clf)
-            
-
-
-
-                ###
-                # try:
-                #     descriptor = td.ForestDescriptor(clf[-1], X.columns, self.__target_labels)
-                #     relevant_features.append(descriptor.get_features(1))
-                #   #  descriptor.predict(clf[-1], X_test)
-                        
-                # except AttributeError:
-                #     pass 
-                ###
-
-
-                f_selector = FeatureSelector(clf, X.columns)
+                f_selector = FeatureSelector(classifier, X.columns)
                 _ = f_selector.get_selected_features()
-                self.__features[clf]["fold_{}".format(n_fold)] = f_selector.get_classifier_features()
+                self.__features[clf][f"fold_{n_fold}"] = f_selector.get_classifier_features()
 
                 viz = metrics.plot_roc_curve(
-                    clf, X_test, y_test, name="", 
+                    classifier, X_test, y_test, name="", 
                     alpha=0.3, lw=1, ax=ax
                 )
                 interp_trp = np.interp(mean_fpr, viz.fpr, viz.tpr)
@@ -178,7 +156,7 @@ class PipelineEvaluator:
             mean_auc = metrics.auc(mean_fpr, mean_tpr)
             std_auc = np.std(aucs)
             ax.plot(mean_fpr, mean_tpr, color="b", 
-                label=r'(AUC = {:.2f} $\pm$ {:.2f})'.format(mean_auc, std_auc),
+                label=fr'(AUC = {mean_auc:.2f} $\pm$ {std_auc:.2f})',
                 lw=2, alpha=.8)
 
             std_tpr = np.std(tprs, axis=0)
@@ -186,21 +164,15 @@ class PipelineEvaluator:
            
             ax.fill_between(mean_fpr, tprs_lower, tprs_upper, color="grey", 
                             alpha=0.2, label=r"$\pm$ 1 std. dev.")
-            ax.set(xlim=[-0.05, 1.05], ylim=[-0.05, 1.05], title="ROC curve of " + clf_name)
+            ax.set(xlim=[-0.05, 1.05], ylim=[-0.05, 1.05], title=f"ROC curve of {clf_name}")
             ax.legend(loc="lower right")
 
-            filename = os.path.join(roc_plot_folder, "{}_{}".format(file_prefix, clf_name))
-            plt.savefig(fname=filename + ".pdf", format="pdf")
+            filename = os.path.join(roc_plot_folder, f"{file_prefix}_{clf_name}")
+            plt.savefig(fname=f"{filename}.pdf", format="pdf")
             plt.close(fig)
 
             self.__rocs[clf] = mean_auc
             self.__avg_roc[clf] = mean_tpr
-
-        # print("Relevant features of RF:")
-        # tot = relevant_features[0]
-        # for x in relevant_features[1:]:
-        #     tot += x
-        # print(tot)
 
         ##dataframe whose columns are the predictions of the tested classifiers
         ##and the rows are the tested examples
@@ -219,6 +191,7 @@ class PipelineEvaluator:
         df["right_pred"] = [list(row).count(y) for row, y in zip(df.values, true_y)]
         #add correct class column
         df["true_y"] = true_y
+        # df.true_y = true_y
 
         return df.sort_values(by=["true_y", "right_pred"], ascending=(True, False)), self.__avg_roc
 

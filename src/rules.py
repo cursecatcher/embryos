@@ -3,31 +3,36 @@
 import argparse
 import os, six, sys
 sys.modules["sklearn.externals.six"] = six 
-import numpy as np
-import matplotlib.pyplot as plt
+# import numpy as np
+# import matplotlib.pyplot as plt
 import pandas as pd 
-from collections import defaultdict, Counter
+from collections import Counter
 from datetime import datetime
+from itertools import chain
 
-from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.metrics import classification_report, cohen_kappa_score, confusion_matrix
-from skrules import DualSkoper, Rule, RuleModel
+from sklearn.model_selection import train_test_split
+# from sklearn.metrics import classification_report, cohen_kappa_score, confusion_matrix
+from skrules import RuleModel
 
 import data_preparation as dp 
-from sampling import smote, bordersmote, adasyn
+# from sampling import smote, bordersmote, adasyn
 
 
 def get_train_val_data(dataset: dp.Dataset, feature_list_filename: str, validation = None):
     #extract subset of features from dataset
     curr_dataset = dataset.select_features(feature_list_filename)
+
     #split in training/test and validation sets
     if validation:
         print("Validation set loaded from external source")
-        #fake split 
         validation = validation.select_features(feature_list_filename)
 
-        df_train, y_train = curr_dataset.data, curr_dataset.target
-        df_val, y_val = validation.data, validation.target 
+        # df_train, y_train = curr_dataset.data, curr_dataset.target
+        # df_val, y_val = validation.data, validation.target 
+
+        training_data = curr_dataset 
+        validation_data = validation 
+
     else:
         print("Validation set extracted from training set")
         #split dataset in two portions 
@@ -41,9 +46,46 @@ def get_train_val_data(dataset: dp.Dataset, feature_list_filename: str, validati
         df_train = pd.DataFrame(X_train, columns = curr_dataset.data.columns)
         df_val = pd.DataFrame(X_val, columns = curr_dataset.data.columns)
 
-    return df_train, df_val, y_train, y_val
+        training_data = dp.Dataset(X=df_train, y=y_train)
+        validation_data = dp.Dataset(X=df_val, y=y_val)
+
+    print(f"Training variables: {training_data.data.columns}")
+    print(f"Validation variables: {validation_data.data.columns}")
+    
+    return training_data, validation_data
 
 
+def build_rule_model(dataset: dp.Dataset, validation: dp.Dataset, **kwargs):
+    threshold = 0.7
+    models = (
+        ("recall", RuleModel(recall_min=threshold, **kwargs)), 
+        ("precision", RuleModel(precision_min=threshold, **kwargs)),
+        ("rec_&_prec", RuleModel(recall_min=threshold, precision_min=threshold, **kwargs))
+    )
+    
+    for n, m in models: 
+        print(f"Training model based on {n}", flush=True)
+        m.fit(dataset.data, dataset.target)
+
+        for r in m.ruleset:
+            print(r)
+
+    model = RuleModel(recall_min=threshold, precision_min=threshold)
+    model.ruleset = list(chain.from_iterable([m.ruleset for _, m in models]))
+    model.validate(validation.data, validation.target)
+
+    return model
+
+def write_to_excel(output_folder, feature_file, results_dict):
+    feature_list_name = "_".join(os.path.basename(feature_file).split(".")[:-1])
+    fln = f"{feature_list_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    xlsx_file = f"{output_folder}/{fln}.xlsx" 
+
+    with pd.ExcelWriter(xlsx_file, mode="w") as writer: 
+        print(f"Writing results in {xlsx_file}")
+
+        for key, table in results_dict.items():
+            save_sheet(table, writer, key)
 
 def enrich_dataframe(df):
     stats = ["mean", "std", "min", "25%", "50%", "75%", "max"]
@@ -53,7 +95,6 @@ def enrich_dataframe(df):
 def reformat_ruleset(ruleset):
     dictionary = { rule: stats for (rule, stats) in ruleset }
     return pd.DataFrame.from_dict(dictionary).T
-
 
 def save_sheet(df, writer, sheet_name):
     try:
@@ -90,11 +131,7 @@ if __name__ == "__main__":
     covariate_to_predict = args.target_feature
     target_labels = args.labels_to_predict
 
-    # datasets = dp.Dataset.read_from_excel(
-    #     filename, covariate_to_predict, target_labels, 
-    #     covs2ignore = covariates_to_ignore, 
-    #     index_column = args.index_column
-    # ) 
+    num_replicas = 10
 
     datasets = dp.Dataset.load_input_data(
         filename, covariate_to_predict, target_labels, 
@@ -107,7 +144,9 @@ if __name__ == "__main__":
             args.validation_set, covariate_to_predict, target_labels, 
             covs2ignore = covariates_to_ignore, 
             index_column = args.index_column)
-        validation = validation[args.validation_set]
+        #get Dataset from dict of Dataset 
+        name = list(validation.keys())[0]
+        validation = validation[name]
 
 
     if len(args.feature_lists) == 0:
@@ -115,7 +154,6 @@ if __name__ == "__main__":
     
     if not os.path.exists(output_path):
         os.mkdir(output_path)
-
 
     feature_lists = list() 
     for feature_list in args.feature_lists:
@@ -126,74 +164,35 @@ if __name__ == "__main__":
                 feature_lists.extend([os.path.join(root, f) for f in files])
 
 
+    
     for feature_file in feature_lists:
         print(f"Using feature file: {feature_file}")
-        
-        result_per_dataset = dict()
+
+        result_per_dataset = dict() 
 
         for name, dataset in datasets.items():
-            print(f"Current dataset: {name}")
-            print(f"Class proportion: {Counter(dataset.target)}")
+            print(f"Current dataset: {name}\nClass proportion: {Counter(dataset.target)}", flush=True)
 
-            df_train, df_val, y_train, y_val = get_train_val_data(
-                dataset, feature_file, validation)
+            generator = dataset.select_features(feature_file).get_train_validation(num_rep=num_replicas)
+            evaluations = dict() 
+            all_rules = list() 
 
-            print(df_train.describe())
-            print(df_val.describe())
+            for n, (t, v) in enumerate(generator, 1):
+                rm = build_rule_model(
+                    t, v, 
+                    n_cv_folds = args.num_folds_cv, 
+                    n_repeats = args.num_replicates, 
+                    n_estimators = 200 
+                )
+                print(f"Iteration #{n}: {len(rm.ruleset)} rules kept.", flush=True)
 
-            print(f"Data proportion in (original) training-test set: {Counter(y_train)}")
-            print(f"Data proportion in validation set: {Counter(y_val)}")
+                if rm.ruleset:
+                    all_rules.extend(rm.ruleset)
+                    evaluations[f"test_{n}"] = reformat_ruleset(rm.test_rules(v.data, v.target))
 
-            ##train model based on recall
-            print("Training model based on recall", flush=True)
-            clf_params = dict(
-                n_cv_folds = args.num_folds_cv, 
-                n_repeats = args.num_replicates, 
-                n_estimators = 500
-            )
+            evaluations["all_rules"] = pd.Series([str(rule) for rule, _ in all_rules], name="rules", dtype=str)
+            print(f"Tot of rules kept: {len(evaluations['all_rules'])}", flush=True)
 
-            rm_recall = RuleModel(recall_min=0.7, **clf_params)
-            rm_recall.fit(df_train, y_train)
-
-            ##train model based on precision 
-            print("Training model based on precision", flush=True)
-            rm_precision = RuleModel(precision_min=0.7, **clf_params)
-            rm_precision.fit(df_train, y_train)
-            
-            ##merge the two rulesets previously obtained
-            rm = RuleModel(recall_min=0.7, precision_min=0.7)
-            rm.ruleset = rm_recall.ruleset + rm_precision.ruleset
-            
-            ##validate the ruleset against the validation set 
-            rm.validate(df_val, y_val)
-
-            print("Rules survived to the validation:")
-
-            for x, _ in rm.ruleset:
-                print(x)
-
-            print(flush=True)
-
-            result_per_dataset[name] = dict(
-                ruleset = rm.ruleset, 
-                reports = rm.reports, 
-                test_whole = rm.test_rules(dataset.data, dataset.target),
-                test_training = rm.test_rules(df_train, y_train),
-                test_valid = rm.test_rules(df_val, y_val)
-            )
+            write_to_excel(output_path, feature_file, evaluations)
 
 
-        
-        feature_list_name = "_".join(os.path.basename(feature_file).split(".")[:-1])
-        fln = f"{feature_list_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-        xlsx_file = f"{output_path}/{fln}.xlsx"
-
-        with pd.ExcelWriter(xlsx_file, mode="w") as writer:
-            print(f"Saving results in {xlsx_file}")
-            
-            for dataset_name, data2save in result_per_dataset.items():
-                for key in ("ruleset", "test_whole", "test_training", "test_valid"):
-                    data = data2save.get(key)
-                    df = reformat_ruleset(data)
-
-                    save_sheet(df, writer, key) 

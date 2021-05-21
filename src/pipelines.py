@@ -28,8 +28,7 @@ class ClassifiersToEvaluate(enum.Enum):
     LOGISTIC_REGRESSION = ("log_reg", LogisticRegression)
     RANDOM_FOREST = ("r_forest", RandomForestClassifier)
     GRADIENT_BOOSTING = ("g_boost", GradientBoostingClassifier)
-#    LINEAR_SVM = ("lin_SVM", LinearSVC) ### do not converge
-#    SDG = ("sdg", SGDClassifier)       ### do not converge 
+    
 
 
 class FeatureSelectionHyperParameters:

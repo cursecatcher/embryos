@@ -48,6 +48,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-i", "--input", dest="input_db", type=str, required=True)
     parser.add_argument("-o", "--output", dest="output_folder", type=str, required=True)
+    parser.add_argument("-t", "--target" , dest="target_feature", type=str, required=True)
     parser.add_argument("-f", dest="feature_lists", nargs="*", default=list())
     parser.add_argument("-r", "--num_rep", dest="num_replicates", type=int, default=0)
     parser.add_argument("--ignore", dest="features_to_ignore", nargs="*", default=list())
@@ -58,18 +59,15 @@ if __name__ == "__main__":
     filename = args.input_db
     output_folder = args.output_folder
     covariates_to_ignore = [
-        "Tecnica", ##use this 
-        "ID Paziente",
-        "tPNa", 
-        "tPNf-tPNa"
+        "Patient ID"
     ]
     covariates_to_ignore.extend(args.features_to_ignore)
 
-    covariate_to_predict = "Output"
-    target_labels = ["NO", "SI"]
+    covariate_to_predict = args.target_feature
+    target_labels = ["NO", "YES"]
 
     datasets = dp.Dataset.read_from_excel(
-        filename, None, covariate_to_predict, target_labels, 
+        filename, covariate_to_predict, target_labels, 
         covs2ignore = covariates_to_ignore
     )
 

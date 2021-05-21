@@ -56,12 +56,12 @@ class PipelinesEvaluator:
             ax.legend(loc="lower right")
             ax.set_xlabel("1-Specificity")
             ax.set_ylabel("Sensitivity")
-            output_filename = os.path.join(output_folder, "ROC_{}.pdf".format(pipeline))
+            output_filename = os.path.join(output_folder, f"ROC_{pipeline}.pdf")
             plt.savefig(fname=output_filename, format="pdf")
             plt.close(fig)
 
 
-            print("{}: AUC = {:.5f}".format(pipeline, mean_auc))
+            print(f"{pipeline}: AUC = {mean_auc:.5f}")
     
     
     def __iter__(self):
@@ -108,16 +108,15 @@ def evaluate_pipelines(evaluator, global_output_folder, base_output_folder):
         utils.make_folder(global_output_folder, base_output_folder)
     )
 
-def replicate_experiment(dataset, output_folder, dataset_name, n_replicates, n_folds):
+def replicate_experiment(dataset, output_folder, dataset_name, n_replicates, n_folds, validation_set = None):
     session_folder = os.path.join(dataset_name, "runs", "run_{}")
     evaluator = PipelinesEvaluator(dataset.data, dataset.target, n_folds, dataset.target_labels)
     dataframes = list() 
 
-    print("Running experiment {} times".format(n_replicates))
+    print(f"Running experiment {n_replicates} times")
 
     for n in range(n_replicates):
-        print(".", end="", flush=True)
-        
+     #   print(".", end="", flush=True)  
         dataframes.append(
             evaluate_pipelines(
                 evaluator, output_folder, session_folder.format(n+1))
@@ -128,22 +127,27 @@ def replicate_experiment(dataset, output_folder, dataset_name, n_replicates, n_f
     return dataframes
 
 
-def classification_task(dataset, mirna_list, output_folder, n_replicates, n_folds):
-    print("\nmiRNA list: {}".format(mirna_list))
+def classification_task(dataset, mirna_list, output_folder, n_replicates, n_folds, validation_set = None):
+    print(f"\nmiRNA list: {mirna_list}")
     mirna_list_name = os.path.basename(os.path.splitext(mirna_list)[0])
 
-    data = dataset.select_features(miRNA_file = mirna_list) #dataset.select_miRNAs(mirna_list)
+    data = dataset.select_features(feature_file = mirna_list) 
+    validation = validation_set.select_features(feature_file = mirna_list) if validation_set is not None else None 
+    
 
-    report_name = "classification_report_{}.tsv".format(mirna_list_name)
+    report_name = f"classification_report_{mirna_list_name}.tsv"
+    replicates = replicate_experiment(
+        data, 
+        output_folder, 
+        mirna_list_name, 
+        n_replicates=n_replicates, 
+        n_folds=n_folds, 
+        validation_set = validation)
+    #
     reduce(
-        lambda x, y: x.add(y, fill_value=0), replicate_experiment(
-            data, 
-            output_folder, 
-            mirna_list_name, 
-            n_replicates=n_replicates, 
-            n_folds=n_folds)
-        ).apply(lambda row: row / n_replicates, axis=1
-            ).to_csv(
+        lambda x, y: x.add(y, fill_value=0), replicates)\
+            .apply(lambda row: row / n_replicates, axis=1)\
+            .to_csv(
                 os.path.join(output_folder, mirna_list_name, report_name), 
                 sep="\t", 
                 float_format="%.3g"
@@ -154,16 +158,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
     parser.add_argument("-o", "--output", dest="output_folder", type=str)
-    # count matrix
-    parser.add_argument("--cm", dest="count_matrices", nargs="*", default=list())
-    # covariate matrix 
-    parser.add_argument("--covs", dest="covariates", nargs="*", default=list())
-    # covariate info 
-    parser.add_argument("--info", dest="covariate_types")
+    #
+    parser.add_argument("-i", "--input", dest="input_dataset", type=str, required=True)
+    #explicit dataset used only for validation purposes
+    parser.add_argument("-v", "--validation", dest="validation_set", type=str)
     # target covariate to predict 
     parser.add_argument("-t", "--target", dest="target_covariate", type=str, required=True)
     # mirna list to restrict the count matrix 
-    parser.add_argument("-m", "--mirnas", dest="mirna_list", nargs="*", default=list())
+    parser.add_argument("-f", dest="feature_lists", nargs="*", default=list())
     # covariates to ignore 
     parser.add_argument("--ignore", dest="covariates_to_ignore", type=str, nargs="*")
     # list of covariates to use 
@@ -171,28 +173,73 @@ if __name__ == "__main__":
     # binary classification target 
     parser.add_argument("--binary", dest="binary_classification_targets", type=str, nargs=2)
     # number of replicates 
-    parser.add_argument("--nrep", dest="num_replicates", type=int, default=100)
+    parser.add_argument("--nrep", dest="num_replicates", type=int, default=1)
     # number of folds of K fold CV 
-    parser.add_argument("--folds", dest="num_folds", type=int, default=10)
+    parser.add_argument("--folds", dest="num_folds", type=int, default=3)
 
     args = parser.parse_args() 
 
-    dataset = dp.Dataset.do_preprocessing(
-        args.count_matrices, args.covariates, args.covariate_types, 
-        args.target_covariate, args.binary_classification_targets,
-        args.covariates_to_use, args.covariates_to_ignore
+    filename = args.input_dataset 
+    output_path = args.output_folder 
+    covs2ignore = args.covariates_to_ignore
+    covs2use = args.covariates_to_use 
+    target_labels = args.binary_classification_targets
+
+    datasets = dp.Dataset.load_input_data(
+        filename, args.target_covariate, target_labels, 
+        covs2ignore = covs2ignore, covs2use = covs2use
     )
+    dataset = datasets[list(datasets.keys())[0]]
+
+
+    validation = None 
+    if args.validation_set:
+        validation = dp.Dataset.load_input_data(
+            args.validation_set, args.target_covariate, target_labels, 
+            covs2ignore = covs2ignore, covs2use = covs2use) 
+#            index_column = args.index_column)
+        #get Dataset from dict of Dataset 
+        name = list(validation.keys())[0]
+        validation = validation[name]
+
+        print(f"Validation set loaded: {name}")
+
+
+
+    feature_lists = list() 
+    for feature_list in args.feature_lists:
+        if os.path.isfile(feature_list):
+            feature_lists.append(feature_list)
+        elif os.path.isdir(feature_list):
+            for root, folders, files in os.walk(feature_list):
+                feature_list.extend([os.path.join(root, f) for f in files])
+
+    
+    for chosen_features in feature_lists:
+        print(f"Running classification task using {chosen_features} file")
+        
+        classification_task(
+            dataset, chosen_features, args.output_folder,
+            n_replicates=args.num_replicates, n_folds=args.num_folds, 
+            validation_set=validation) 
+
+
+    # dataset = dp.Dataset.do_preprocessing(
+    #     args.count_matrices, args.covariates, args.covariate_types, 
+    #     args.target_covariate, args.binary_classification_targets,
+    #     args.covariates_to_use, args.covariates_to_ignore
+    # )
     
 
     #to parallelize ? 
 
     #do experiments, then merge the results in a single dataframe 
-    for mirna_list in args.mirna_list:
-        if os.path.isfile(mirna_list):
-            classification_task(dataset, mirna_list, args.output_folder, n_replicates=args.num_replicates, n_folds=args.num_folds)
-        elif os.path.isdir(mirna_list):
-            print("Entering in {} directory".format(mirna_list))
-            for content in os.listdir(mirna_list):
-                classification_task(dataset, os.path.join(mirna_list, content), args.output_folder, n_replicates=args.num_replicates, n_folds=args.num_folds)
+    # for mirna_list in args.mirna_list:
+    #     if os.path.isfile(mirna_list):
+    #         classification_task(dataset, mirna_list, args.output_folder, n_replicates=args.num_replicates, n_folds=args.num_folds)
+    #     elif os.path.isdir(mirna_list):
+    #         print("Entering in {} directory".format(mirna_list))
+    #         for content in os.listdir(mirna_list):
+    #             classification_task(dataset, os.path.join(mirna_list, content), args.output_folder, n_replicates=args.num_replicates, n_folds=args.num_folds)
 
 

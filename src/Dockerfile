@@ -9,7 +9,8 @@ RUN pip install --upgrade pip && \
         matplotlib \
         pandas \
         imbalanced-learn \
-        openpyxl \
+        openpyxl 
+RUN pip install --no-cache-dir \
         git+https://github.com/cursecatcher/skope-rules.git
 
 COPY *.py /src/

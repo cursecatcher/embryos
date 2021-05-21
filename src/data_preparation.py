@@ -42,7 +42,7 @@ def prepare_feature_names(df: pd.DataFrame):
 
 
 class Dataset:
-    def __init__(self, count_matrices = None, covariate_matrices = None):
+    def __init__(self, count_matrices = None, covariate_matrices = None, X = None, y = None):
         self.__covariate_matrix = None ## XXX to rename
         self.__target = None 
         self.__target_labels = None 
@@ -51,30 +51,34 @@ class Dataset:
         if isinstance(count_matrices, list) and isinstance(covariate_matrices, list):
             covariates = pd.concat(fix_input(covariate_matrices))
             counts = pd.concat(fix_input(count_matrices, transpose=True))
-            
-            # print(Counter(covariates["class"]))
-
-            # print(f"Shapes now: {covariates.shape} -- {counts.shape}")
 
             if len(counts) > 0:
                 covariates = pd.merge(covariates, counts, left_index=True, right_index=True)
             
-                # print(f"Matrices merged; new shape: {covariates.shape}")
-                # print(Counter(covariates["class"]))
-            
             self.__covariate_matrix = covariates
 
-            # self.__count_matrix = pd.concat(counts) if counts else None 
-            # self.__covariate_matrix = pd.concat(covariates) if covariates else None 
-        
-        
+        elif isinstance(X, pd.DataFrame) and isinstance(y, np.ndarray): #X is not None and y is not None:
+            self.__covariate_matrix = X 
+            self.__target = y 
 
+    
+    def get_train_validation(self, size_val=0.1, num_rep=1):
+        #XXX - build as generator 
+        all_data = self.data.copy()
+        target_col = "classification_target"
+        all_data[target_col] = self.target 
 
-    # def __init__(self):
-    #     self.__covariate_matrix = None 
-    #     self.__target = None 
-    #     self.__target_labels = None 
-    #     self.__target_encoding = None 
+        for n in range(num_rep):
+            validation = pd.concat([
+                df.sample(frac=size_val) for _, df in all_data.groupby(target_col)
+            ])
+            training = pd.concat([all_data, validation]).drop_duplicates(keep=False)
+
+            t = Dataset(X=training.drop(columns=[target_col]), y = training[target_col].to_numpy())
+            v = Dataset(X=validation.drop(columns=[target_col]), y = validation[target_col].to_numpy())
+
+            yield t, v
+
 
     @classmethod
     def load_input_data(cls, input_data, cov2predict, target_labels, covs2use = None, covs2ignore = None, index_column = None):
@@ -104,11 +108,22 @@ class Dataset:
             if index_column:
                 df.set_index(index_column.lower(), inplace=True)
             
-            #remove unnecessary columns
-            bad_cols = [col.lower() for col in covs2ignore]
-            bad_cols.extend([col for col in df.columns if col.startswith("unnamed:")])
+            bad_cols = None 
+            if covs2use is None:
+                #remove unnecessary columns
+                bad_cols = [col for col in df.columns if col.startswith("unnamed:")]
+                if covs2ignore:
+                    bad_cols.extend([col.lower() for col in covs2ignore])
+            else:
+                #remove all features except those in covs2use list 
+                whole_set = set(df.columns)
+                whole_set.remove(cov2predict)
+                bad_cols = whole_set.difference({x.lower() for x in covs2use})
+
             if bad_cols:
                 df.drop(columns=bad_cols, inplace=True)
+
+
             #fix numerical values and encode categorical features
             cov2predict = cov2predict.lower()
             for col in df.columns:
@@ -213,21 +228,21 @@ class Dataset:
 
         return datasets 
     
-    @classmethod
-    def do_preprocessing(cls, count_matrices, covariate_matrices, covs_types, cov2predict, target_labels, covs2use, covs2ignore):
-        dataset = Dataset(count_matrices, covariate_matrices)
+#     @classmethod
+#     def do_preprocessing(cls, count_matrices, covariate_matrices, covs_types, cov2predict, target_labels, covs2use, covs2ignore):
+#         dataset = Dataset(count_matrices, covariate_matrices)
 
-        if covs2use:
-            f_to_keep = covs2use + [cov2predict]
-            dataset.select_covariates(f_to_keep)
-        elif covs2ignore:
-            dataset.remove_covariates(covs2ignore)
+#         if covs2use:
+#             f_to_keep = covs2use + [cov2predict]
+#             dataset.select_covariates(f_to_keep)
+#         elif covs2ignore:
+#             dataset.remove_covariates(covs2ignore)
         
-        dataset.filter_by_target(cov2predict, target_labels)
-        dataset.fix_missing_values() #not implemented 
-#        dataset.encode_categorical(covs_types)
+#         dataset.filter_by_target(cov2predict, target_labels)
+#         dataset.fix_missing_values() #not implemented 
+# #        dataset.encode_categorical(covs_types)
 
-        return dataset 
+#         return dataset 
     
     @property
     def cov_matrix(self):
@@ -255,7 +270,7 @@ class Dataset:
 
         print(f"Target: {target_cov}\nLabels: {allowed_values}")
         # print(self.data.columns)
-        print(self.data)
+        # print(self.data)
 
         if not allowed_values:
             allowed_values = set(self.cov_matrix[target_cov])
@@ -266,12 +281,12 @@ class Dataset:
         mask = self.cov_matrix[target_cov].isin(allowed_values)
         cov_masked = self.cov_matrix[mask]
 
-        mapping = {label: encoding for encoding, label in enumerate(allowed_values)}
-        self.__target = cov_masked[target_cov].replace(mapping).to_numpy()
+        self.__target_encoding = {label: encoding for encoding, label in enumerate(allowed_values)}
+        self.__target = cov_masked[target_cov].replace(self.__target_encoding).to_numpy()
         self.__covariate_matrix = cov_masked.drop(columns=[target_cov])
-        self.__target_encoding = mapping
+    
 
-        print(f"\nTarget labels encoded with the following mapping: {mapping}")
+        print(f"\nTarget labels encoded with the following mapping: {self.__target_encoding}")
 
         return self
         
@@ -347,7 +362,7 @@ class Dataset:
                         pd.read_csv(feature_file, index_col=0, sep="\t") \
                             if feature_file else None
         if flist is None:
-            raise Exception("eeeeeeh")
+            raise Exception("No feature list nor file provided. ")
             
         dataset = Dataset()
         dataset.__target = self.__target 
@@ -357,7 +372,7 @@ class Dataset:
         covariates = prepare_feature_names(flist.index.to_series())
 
         dataset.__covariate_matrix = self.__covariate_matrix[covariates]
-        print(f"Covariate matrix filtered. Covariates have been selected from {flist.index} (file={feature_file})")
+        print(f"Covariate matrix filtered (file={feature_file})")
         
         
         return dataset
